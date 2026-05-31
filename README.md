@@ -2,7 +2,7 @@
 
 > A local routing bridge that brings Xiaomi MiMo to `cc switch` + Codex.
 
-[🌐 Homepage](https://simonleen22.github.io/CCMimoLink/) · [中文文档](#中文) · [Windows 使用指南（中文）](USAGE_zh.md)
+[🌐 Homepage](https://simonleen22.github.io/CCMimoLink/) · [中文文档](#中文) · [Windows 使用指南（中文）](USAGE_zh.md) · [Releases](https://github.com/2144291529/CCMimoLink-win/releases)
 
 ---
 
