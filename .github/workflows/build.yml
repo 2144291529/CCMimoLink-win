@@ -69,6 +69,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -77,8 +79,34 @@ jobs:
       - name: List artifacts
         run: ls -la dist/
 
+      - name: Build release notes
+        id: notes
+        run: |
+          {
+            echo 'body<<RELEASE_NOTES_EOF'
+            if [ -f USAGE_zh.md ]; then
+              cat USAGE_zh.md
+              echo
+              echo '---'
+              echo
+            fi
+            echo '## Downloads'
+            echo
+            echo '| Platform | File |'
+            echo '| --- | --- |'
+            echo '| Windows x64 | `ccmimolink-windows-amd64.exe` |'
+            echo '| Windows ARM64 | `ccmimolink-windows-arm64.exe` |'
+            echo '| Linux x64 | `ccmimolink-linux-amd64` |'
+            echo '| Linux ARM64 | `ccmimolink-linux-arm64` |'
+            echo '| macOS Intel | `ccmimolink-darwin-amd64` |'
+            echo '| macOS Apple Silicon | `ccmimolink-darwin-arm64` |'
+            echo 'RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body: ${{ steps.notes.outputs.body }}
+          append_body: true
           generate_release_notes: true
