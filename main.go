@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,13 +13,14 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -39,10 +41,23 @@ var (
 	limiter       = newUpstreamLimiter()
 	responseStore = newResponseStore(envIntOrDefault("MIMO_PROXY_RESPONSE_STORE_MAX", defaultResponseStoreSize))
 	skipCCSwitchSync = strings.EqualFold(strings.TrimSpace(os.Getenv("MIMO_PROXY_SKIP_CC_SWITCH_SYNC")), "true")
-	ccSwitchSettingsPath = envOrDefault("CC_SWITCH_SETTINGS_PATH", filepath.Join(envOrDefault("HOME", "/Users/shuiyang"), ".cc-switch", "settings.json"))
-	ccSwitchDBPath = envOrDefault("CC_SWITCH_DB_PATH", filepath.Join(envOrDefault("HOME", "/Users/shuiyang"), ".cc-switch", "cc-switch.db"))
-	codexConfigPath = envOrDefault("CODEX_CONFIG_PATH", filepath.Join(envOrDefault("HOME", "/Users/shuiyang"), ".codex", "config.toml"))
+	ccSwitchSettingsPath = envOrDefault("CC_SWITCH_SETTINGS_PATH", filepath.Join(userHome(), ".cc-switch", "settings.json"))
+	ccSwitchDBPath = envOrDefault("CC_SWITCH_DB_PATH", filepath.Join(userHome(), ".cc-switch", "cc-switch.db"))
+	codexConfigPath = envOrDefault("CODEX_CONFIG_PATH", filepath.Join(userHome(), ".codex", "config.toml"))
 )
+
+func userHome() string {
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return home
+	}
+	if v := strings.TrimSpace(os.Getenv("USERPROFILE")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("HOME")); v != "" {
+		return v
+	}
+	return "."
+}
 
 func applyModelFlag() {
 	useV25 := flag.Bool("v2.5", false, "use mimo-v2.5 for text requests")
@@ -302,51 +317,52 @@ func loadCCSwitchSettings(path string) (CCSwitchSettings, error) {
 	return settings, nil
 }
 
+func openCCSwitchDB(dbPath string) (*sql.DB, error) {
+	dsn := fmt.Sprintf("file:%s?mode=rw&_pragma=busy_timeout(5000)", filepath.ToSlash(dbPath))
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
 func loadCCSwitchProvider(dbPath, providerID string) (ccSwitchProviderRecord, error) {
 	var record ccSwitchProviderRecord
-	cmd := exec.Command("sqlite3", "-json", dbPath, fmt.Sprintf("SELECT id, settings_config, name FROM providers WHERE id = '%s' AND app_type = 'codex';", strings.ReplaceAll(providerID, "'", "''")))
-	output, err := cmd.Output()
+	db, err := openCCSwitchDB(dbPath)
 	if err != nil {
 		return record, err
 	}
-	var rows []struct {
-		ID             string `json:"id"`
-		SettingsConfig string `json:"settings_config"`
-		Name           string `json:"name"`
-	}
-	if err := json.Unmarshal(output, &rows); err != nil {
+	defer db.Close()
+
+	row := db.QueryRow(`SELECT id, settings_config, name FROM providers WHERE id = ? AND app_type = 'codex'`, providerID)
+	if err := row.Scan(&record.ID, &record.SettingsConfig, &record.Name); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return record, fmt.Errorf("cc switch provider %s not found", providerID)
+		}
 		return record, err
 	}
-	if len(rows) == 0 {
-		return record, fmt.Errorf("cc switch provider %s not found", providerID)
-	}
-	record.ID = rows[0].ID
-	record.SettingsConfig = rows[0].SettingsConfig
-	record.Name = rows[0].Name
 	return record, nil
 }
 
 func loadFirstMimoProvider(dbPath string) (ccSwitchProviderRecord, error) {
 	var record ccSwitchProviderRecord
-	cmd := exec.Command("sqlite3", "-json", dbPath, "SELECT id, settings_config, name FROM providers WHERE app_type = 'codex' AND lower(name) LIKE '%mimo%' ORDER BY id LIMIT 1;")
-	output, err := cmd.Output()
+	db, err := openCCSwitchDB(dbPath)
 	if err != nil {
 		return record, err
 	}
-	var rows []struct {
-		ID             string `json:"id"`
-		SettingsConfig string `json:"settings_config"`
-		Name           string `json:"name"`
-	}
-	if err := json.Unmarshal(output, &rows); err != nil {
+	defer db.Close()
+
+	row := db.QueryRow(`SELECT id, settings_config, name FROM providers WHERE app_type = 'codex' AND lower(name) LIKE '%mimo%' ORDER BY id LIMIT 1`)
+	if err := row.Scan(&record.ID, &record.SettingsConfig, &record.Name); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return record, fmt.Errorf("Xiaomi MiMo provider not found in cc switch; please add it first")
+		}
 		return record, err
 	}
-	if len(rows) == 0 {
-		return record, fmt.Errorf("Xiaomi MiMo provider not found in cc switch; please add it first")
-	}
-	record.ID = rows[0].ID
-	record.SettingsConfig = rows[0].SettingsConfig
-	record.Name = rows[0].Name
 	return record, nil
 }
 
@@ -363,6 +379,34 @@ func extractCCSwitchAPIKey(settingsConfig string) (string, error) {
 		return "", fmt.Errorf("cc switch Xiaomi MiMo API key is empty; please add Xiaomi MiMo and input the API key in cc switch first")
 	}
 	return apiKey, nil
+}
+
+// extractProviderSectionName parses the cc-switch provider's stored TOML config
+// and returns the model_provider value (e.g. "mimo", "xiaomi_mimo_token_plan",
+// "custom"). Falls back to "mimo" to preserve the project's historical default.
+func extractProviderSectionName(settingsConfig string) string {
+	var payload struct {
+		Config string `json:"config"`
+	}
+	if err := json.Unmarshal([]byte(settingsConfig), &payload); err != nil {
+		return "mimo"
+	}
+	for _, line := range strings.Split(payload.Config, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "model_provider") {
+			continue
+		}
+		eq := strings.Index(trimmed, "=")
+		if eq < 0 {
+			continue
+		}
+		value := strings.TrimSpace(trimmed[eq+1:])
+		value = strings.Trim(value, "\"'")
+		if value != "" {
+			return value
+		}
+	}
+	return "mimo"
 }
 
 func decodeCCSwitchProviderSettings(settingsConfig string) (map[string]interface{}, error) {
@@ -421,7 +465,63 @@ func replaceTOMLStringInSection(content, section, key, value string) string {
 	return content
 }
 
-func updateCodexConfig(path, apiKey string) (codexConfigUpdate, error) {
+func upsertTOMLHeaderSection(content, sectionHeader string, kv map[string]string) string {
+	lines := strings.Split(content, "\n")
+	headerIdx := -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) == sectionHeader {
+			headerIdx = i
+			break
+		}
+	}
+	if headerIdx >= 0 {
+		end := len(lines)
+		for j := headerIdx + 1; j < len(lines); j++ {
+			trimmed := strings.TrimSpace(lines[j])
+			if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+				end = j
+				break
+			}
+		}
+		seen := map[string]bool{}
+		for j := headerIdx + 1; j < end; j++ {
+			line := lines[j]
+			trimmed := strings.TrimSpace(line)
+			for key, value := range kv {
+				if strings.HasPrefix(trimmed, key+" = \"") || strings.HasPrefix(trimmed, key+"=\"") {
+					indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+					lines[j] = indent + key + " = \"" + value + "\""
+					seen[key] = true
+					break
+				}
+			}
+		}
+		toAdd := []string{}
+		for key, value := range kv {
+			if !seen[key] {
+				toAdd = append(toAdd, key+" = \""+value+"\"")
+			}
+		}
+		if len(toAdd) > 0 {
+			insertion := append([]string{}, lines[:end]...)
+			insertion = append(insertion, toAdd...)
+			insertion = append(insertion, lines[end:]...)
+			lines = insertion
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	block := []string{"", sectionHeader}
+	for key, value := range kv {
+		block = append(block, key+" = \""+value+"\"")
+	}
+	if len(content) > 0 && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	return content + strings.Join(block, "\n") + "\n"
+}
+
+func updateCodexConfig(path, apiKey, sectionName string) (codexConfigUpdate, error) {
 	result := codexConfigUpdate{Path: path, APIKey: apiKey, BaseURL: localProxyURL()}
 	backupPath, err := backupFile(path)
 	if err != nil {
@@ -434,9 +534,16 @@ func updateCodexConfig(path, apiKey string) (codexConfigUpdate, error) {
 	}
 	content := string(data)
 	updated := content
-	updated = replaceTOMLStringInSection(updated, "[model_providers.mimo]", "base_url", localProxyURL())
-	updated = replaceTOMLStringInSection(updated, "[model_providers.mimo.http_headers]", "Authorization", "Bearer local-mimo-proxy")
-	updated = replaceTOMLStringInSection(updated, "[model_providers.mimo.http_headers]", "X-Mimo-Api-Key", apiKey)
+
+	providerHeader := "[model_providers." + sectionName + "]"
+	headersHeader := "[model_providers." + sectionName + ".http_headers]"
+
+	updated = replaceTOMLStringInSection(updated, providerHeader, "base_url", localProxyURL())
+	updated = upsertTOMLHeaderSection(updated, headersHeader, map[string]string{
+		"Authorization":  "Bearer local-mimo-proxy",
+		"X-Mimo-Api-Key": apiKey,
+	})
+
 	if updated == content {
 		return result, nil
 	}
@@ -445,10 +552,6 @@ func updateCodexConfig(path, apiKey string) (codexConfigUpdate, error) {
 	}
 	result.Updated = true
 	return result, nil
-}
-
-func sqlQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func rewriteCCSwitchProxyRoute(dbPath, providerID string) error {
@@ -462,21 +565,33 @@ func rewriteCCSwitchProxyRoute(dbPath, providerID string) error {
 	}
 	configText, _ := payload["config"].(string)
 	configText = strings.ReplaceAll(configText, "base_url = \"https://api.xiaomimimo.com/v1\"", "base_url = \""+localProxyURL()+"\"")
+	configText = strings.ReplaceAll(configText, "base_url = \"https://token-plan-cn.xiaomimimo.com/v1\"", "base_url = \""+localProxyURL()+"\"")
 	configText = strings.ReplaceAll(configText, "base_url = \"http://127.0.0.1:9876/v1\"", "base_url = \""+localProxyURL()+"\"")
 	payload["config"] = configText
 	updatedJSON, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	providerIDSQL := sqlQuote(providerID)
-	settingsConfigSQL := sqlQuote(string(updatedJSON))
-	localProxyURLSQL := sqlQuote(localProxyURL())
-	cmd := exec.Command("sqlite3", dbPath,
-		fmt.Sprintf("UPDATE providers SET settings_config = %s WHERE id = %s AND app_type = 'codex'; UPDATE provider_endpoints SET url = %s WHERE provider_id = %s AND app_type = 'codex';", settingsConfigSQL, providerIDSQL, localProxyURLSQL, providerIDSQL),
-	)
-	output, err := cmd.CombinedOutput()
+	db, err := openCCSwitchDB(dbPath)
 	if err != nil {
-		return fmt.Errorf("sqlite3 update failed: %w: %s", err, strings.TrimSpace(string(output)))
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = 'codex'`, string(updatedJSON), providerID); err != nil {
+		return fmt.Errorf("update providers failed: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE provider_endpoints SET url = ? WHERE provider_id = ? AND app_type = 'codex'`, localProxyURL(), providerID); err != nil {
+		return fmt.Errorf("update provider_endpoints failed: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit failed: %w", err)
 	}
 	return nil
 }
@@ -509,14 +624,15 @@ func syncCCSwitchAndCodex() error {
 	if err != nil {
 		return err
 	}
+	sectionName := extractProviderSectionName(provider.SettingsConfig)
 	if err := rewriteCCSwitchProxyRoute(ccSwitchDBPath, provider.ID); err != nil {
 		return err
 	}
-	update, err := updateCodexConfig(codexConfigPath, apiKey)
+	update, err := updateCodexConfig(codexConfigPath, apiKey, sectionName)
 	if err != nil {
 		return err
 	}
-	log.Printf("[CCMimoLink] synced cc switch Xiaomi MiMo provider %s to local route %s", provider.ID, localProxyURL())
+	log.Printf("[CCMimoLink] synced cc switch Xiaomi MiMo provider %s to local route %s (codex section: [model_providers.%s])", provider.ID, localProxyURL(), sectionName)
 	log.Printf("[CCMimoLink] backed up Codex config to %s", update.BackupPath)
 	if update.Updated {
 		log.Printf("[CCMimoLink] updated Codex Xiaomi MiMo headers from cc switch API key")

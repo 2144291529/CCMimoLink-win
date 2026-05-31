@@ -2,7 +2,7 @@
 
 > A local routing bridge that brings Xiaomi MiMo to `cc switch` + Codex.
 
-[🌐 Homepage](https://simonleen22.github.io/CCMimoLink/) · [中文文档](#中文)
+[🌐 Homepage](https://simonleen22.github.io/CCMimoLink/) · [中文文档](#中文) · [Windows 使用指南（中文）](USAGE_zh.md)
 
 ---
 
@@ -63,6 +63,8 @@ Add a Xiaomi MiMo provider in `cc switch` and enter your API key.
 
 ```bash
 go build -o ccmimolink .
+# Windows
+go build -o ccmimolink.exe .
 ```
 
 ### Step 3: Sync only (optional)
@@ -71,12 +73,16 @@ Rewrite routes and refresh config without starting the proxy:
 
 ```bash
 ./ccmimolink --sync-only
+# Windows
+./ccmimolink.exe --sync-only
 ```
 
 ### Step 4: Run the proxy
 
 ```bash
 ./ccmimolink
+# Windows
+./ccmimolink.exe
 ```
 
 Default local proxy address: `http://127.0.0.1:9876/v1`
@@ -110,9 +116,9 @@ All runtime settings are provided via environment variables:
 | `MIMO_PROXY_429_BACKOFF_MS` | `30000` | Backoff duration after an upstream `429` response (ms). |
 | `MIMO_PROXY_LOG` | `mimo_proxy.log` | Log file path. |
 | `MIMO_PROXY_SKIP_CC_SWITCH_SYNC` | `false` | Skip startup sync (for development). |
-| `CC_SWITCH_SETTINGS_PATH` | `~/.cc-switch/settings.json` | Path to cc switch settings file. |
-| `CC_SWITCH_DB_PATH` | `~/.cc-switch/cc-switch.db` | Path to cc switch database. |
-| `CODEX_CONFIG_PATH` | `~/.codex/config.toml` | Path to local Codex config. |
+| `CC_SWITCH_SETTINGS_PATH` | `~/.cc-switch/settings.json` (Windows: `%USERPROFILE%\.cc-switch\settings.json`) | Path to cc switch settings file. |
+| `CC_SWITCH_DB_PATH` | `~/.cc-switch/cc-switch.db` (Windows: `%USERPROFILE%\.cc-switch\cc-switch.db`) | Path to cc switch database. |
+| `CODEX_CONFIG_PATH` | `~/.codex/config.toml` (Windows: `%USERPROFILE%\.codex\config.toml`) | Path to local Codex config. |
 
 ## Supported Endpoints
 
@@ -138,6 +144,13 @@ All runtime settings are provided via environment variables:
 - `cc switch` installed locally
 - A configured Xiaomi MiMo API key in `cc switch`
 - Local Codex config at `~/.codex/config.toml` (or an overridden path via environment variable)
+
+### Windows notes
+
+- Default paths use `%USERPROFILE%` (e.g. `%USERPROFILE%\.cc-switch\cc-switch.db`). They are resolved via Go's `os.UserHomeDir()`, so no env-var setup is needed on a default Windows install.
+- The cc-switch database is read/written through the pure-Go `modernc.org/sqlite` driver — you do **not** need to install the `sqlite3` CLI on Windows.
+- Run the binary from PowerShell, `cmd`, or Windows Terminal — `.\ccmimolink.exe --sync-only` and `.\ccmimolink.exe`.
+- The Codex `[model_providers.<name>]` section that gets rewritten is auto-detected from the cc-switch provider's `model_provider = "..."` value (e.g. `mimo`, `xiaomi_mimo_token_plan`, `custom`). If your `~/.codex/config.toml` is shared with another tool that also writes that same section, switch the active cc-switch provider to MiMo before running CCMimoLink so the two tools don't fight over the same section.
 
 ## Troubleshooting
 
