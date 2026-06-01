@@ -13,7 +13,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,17 +35,20 @@ const (
 )
 
 var (
-	mimoBase      = envOrDefault("MIMO_BASE_URL", defaultMimoBase)
-	mimoKey       = strings.TrimSpace(os.Getenv("MIMO_API_KEY"))
-	mimoModel     = envOrDefault("MIMO_MODEL", defaultMimoModel)
-	proxyPort     = envOrDefault("MIMO_PROXY_PORT", defaultProxyPort)
-	client        = &http.Client{}
-	limiter       = newUpstreamLimiter()
-	responseStore = newResponseStore(envIntOrDefault("MIMO_PROXY_RESPONSE_STORE_MAX", defaultResponseStoreSize))
-	skipCCSwitchSync = strings.EqualFold(strings.TrimSpace(os.Getenv("MIMO_PROXY_SKIP_CC_SWITCH_SYNC")), "true")
+	mimoBase             = envOrDefault("MIMO_BASE_URL", defaultMimoBase)
+	mimoKey              = strings.TrimSpace(os.Getenv("MIMO_API_KEY"))
+	mimoModel            = envOrDefault("MIMO_MODEL", defaultMimoModel)
+	proxyPort            = envOrDefault("MIMO_PROXY_PORT", defaultProxyPort)
+	client               = &http.Client{}
+	limiter              = newUpstreamLimiter()
+	responseStore        = newResponseStore(envIntOrDefault("MIMO_PROXY_RESPONSE_STORE_MAX", defaultResponseStoreSize))
+	skipCCSwitchSync     = strings.EqualFold(strings.TrimSpace(os.Getenv("MIMO_PROXY_SKIP_CC_SWITCH_SYNC")), "true")
 	ccSwitchSettingsPath = envOrDefault("CC_SWITCH_SETTINGS_PATH", filepath.Join(userHome(), ".cc-switch", "settings.json"))
-	ccSwitchDBPath = envOrDefault("CC_SWITCH_DB_PATH", filepath.Join(userHome(), ".cc-switch", "cc-switch.db"))
-	codexConfigPath = envOrDefault("CODEX_CONFIG_PATH", filepath.Join(userHome(), ".codex", "config.toml"))
+	ccSwitchDBPath       = envOrDefault("CC_SWITCH_DB_PATH", filepath.Join(userHome(), ".cc-switch", "cc-switch.db"))
+	codexConfigPath      = envOrDefault("CODEX_CONFIG_PATH", filepath.Join(userHome(), ".codex", "config.toml"))
+	autoStartProxy       = false
+	noBrowserOpen        = false
+	proxyControl         = newProxyControl()
 )
 
 func userHome() string {
@@ -63,6 +68,8 @@ func applyModelFlag() {
 	useV25 := flag.Bool("v2.5", false, "use mimo-v2.5 for text requests")
 	useV25Pro := flag.Bool("v2.5-pro", false, "use mimo-v2.5-pro for text requests")
 	syncOnly := flag.Bool("sync-only", false, "sync cc switch and Codex config, then exit")
+	autoStart := flag.Bool("auto-start", false, "start the proxy immediately after the manager UI starts")
+	noOpen := flag.Bool("no-open", false, "do not open the manager UI in the browser")
 	flag.Parse()
 
 	if *useV25 && *useV25Pro {
@@ -75,6 +82,8 @@ func applyModelFlag() {
 	case *useV25Pro:
 		mimoModel = proMimoModel
 	}
+	autoStartProxy = *autoStart
+	noBrowserOpen = *noOpen
 	mimoKey = strings.TrimSpace(os.Getenv("MIMO_API_KEY"))
 	if *syncOnly {
 		setupLogging()
@@ -1930,35 +1939,427 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Write(respBody)
 }
 
+type ProxyControl struct {
+	mu        sync.RWMutex
+	running   bool
+	starting  bool
+	lastError string
+	startedAt time.Time
+	stoppedAt time.Time
+}
+
+func newProxyControl() *ProxyControl {
+	return &ProxyControl{
+		stoppedAt: time.Now(),
+	}
+}
+
+func (c *ProxyControl) IsRunning() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.running
+}
+
+func (c *ProxyControl) Start() error {
+	c.mu.Lock()
+	if c.running || c.starting {
+		c.mu.Unlock()
+		return nil
+	}
+	c.starting = true
+	c.lastError = ""
+	c.mu.Unlock()
+
+	err := syncCCSwitchAndCodex()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.starting = false
+	if err != nil {
+		c.lastError = err.Error()
+		return err
+	}
+	c.running = true
+	c.startedAt = time.Now()
+	c.stoppedAt = time.Time{}
+	return nil
+}
+
+func (c *ProxyControl) Stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.running = false
+	c.starting = false
+	c.stoppedAt = time.Now()
+}
+
+func (c *ProxyControl) Snapshot() map[string]interface{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return map[string]interface{}{
+		"running":    c.running,
+		"starting":   c.starting,
+		"lastError":  c.lastError,
+		"startedAt":  formatTime(c.startedAt),
+		"stoppedAt":  formatTime(c.stoppedAt),
+		"proxyURL":   localProxyURL(),
+		"managerURL": "http://127.0.0.1:" + proxyPort + "/",
+		"model":      mimoModel,
+	}
+}
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
+func requireProxyRunning(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !proxyControl.IsRunning() {
+			writeErrorResponse(w, http.StatusServiceUnavailable, "proxy_stopped", "CCMimoLink proxy is stopped. Open the manager UI and click Start.")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func handleControlStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, proxyControl.Snapshot())
+}
+
+func handleControlStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := proxyControl.Start(); err != nil {
+		log.Printf("[CCMimoLink] proxy start failed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, proxyControl.Snapshot())
+		return
+	}
+	log.Printf("[CCMimoLink] proxy started at %s", localProxyURL())
+	writeJSON(w, http.StatusOK, proxyControl.Snapshot())
+}
+
+func handleControlStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	proxyControl.Stop()
+	log.Printf("[CCMimoLink] proxy stopped")
+	writeJSON(w, http.StatusOK, proxyControl.Snapshot())
+}
+
+func handleControlExit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "exiting"})
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		os.Exit(0)
+	}()
+}
+
+func handleManagerUI(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(managerHTML))
+}
+
+func openManagerBrowser(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("[CCMimoLink] open manager UI manually: %s (%v)", url, err)
+	}
+}
+
+const managerHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CCMimoLink 管理</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      background: #f4f6f8;
+      color: #17202a;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+    }
+    main {
+      width: min(560px, calc(100vw - 32px));
+      padding: 28px;
+      background: #ffffff;
+      border: 1px solid #d7dee8;
+      border-radius: 8px;
+      box-shadow: 0 12px 32px rgba(18, 35, 58, .12);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 26px;
+      letter-spacing: 0;
+    }
+    .sub {
+      margin: 0 0 24px;
+      color: #5b6776;
+      line-height: 1.6;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px;
+      border: 1px solid #d7dee8;
+      border-radius: 8px;
+      background: #f9fafb;
+      font-weight: 600;
+    }
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: #8a96a3;
+      flex: 0 0 auto;
+    }
+    .running .dot { background: #198754; }
+    .starting .dot { background: #d89000; }
+    .stopped .dot { background: #c03221; }
+    dl {
+      display: grid;
+      grid-template-columns: 96px 1fr;
+      gap: 10px 14px;
+      margin: 22px 0;
+      font-size: 14px;
+    }
+    dt { color: #5b6776; }
+    dd { margin: 0; word-break: break-all; }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    button {
+      min-width: 112px;
+      min-height: 42px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      padding: 0 16px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    button:disabled {
+      cursor: wait;
+      opacity: .62;
+    }
+    .primary {
+      background: #146c43;
+      color: white;
+    }
+    .danger {
+      background: #b42318;
+      color: white;
+    }
+    .secondary {
+      background: #eef2f6;
+      color: #17202a;
+      border-color: #ccd5df;
+    }
+    .error {
+      display: none;
+      margin-top: 16px;
+      padding: 12px 14px;
+      border-radius: 7px;
+      background: #fff1f0;
+      border: 1px solid #ffccc7;
+      color: #a8071a;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { background: #111820; color: #edf2f7; }
+      main { background: #18212b; border-color: #2f3b48; box-shadow: none; }
+      .sub, dt { color: #9da9b7; }
+      .status { background: #121a22; border-color: #2f3b48; }
+      .secondary { background: #26313d; color: #edf2f7; border-color: #3a4654; }
+      .error { background: #3b1515; border-color: #7f2424; color: #ffc7c2; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>CCMimoLink 管理</h1>
+    <p class="sub">在这里开启或关闭本地 MiMo 代理。关闭后管理页仍保留，Codex 请求会收到代理已停止的提示。</p>
+    <div id="stateBox" class="status stopped"><span class="dot"></span><span id="stateText">读取状态中...</span></div>
+    <dl>
+      <dt>代理地址</dt><dd id="proxyURL">-</dd>
+      <dt>模型</dt><dd id="model">-</dd>
+      <dt>启动时间</dt><dd id="startedAt">-</dd>
+      <dt>停止时间</dt><dd id="stoppedAt">-</dd>
+    </dl>
+    <div class="actions">
+      <button id="startBtn" class="primary" type="button">开启代理</button>
+      <button id="stopBtn" class="secondary" type="button">关闭代理</button>
+      <button id="exitBtn" class="danger" type="button">退出程序</button>
+    </div>
+    <div id="errorBox" class="error"></div>
+  </main>
+  <script>
+    const stateBox = document.getElementById('stateBox');
+    const stateText = document.getElementById('stateText');
+    const proxyURL = document.getElementById('proxyURL');
+    const model = document.getElementById('model');
+    const startedAt = document.getElementById('startedAt');
+    const stoppedAt = document.getElementById('stoppedAt');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const exitBtn = document.getElementById('exitBtn');
+    const errorBox = document.getElementById('errorBox');
+
+    function showError(message) {
+      errorBox.style.display = message ? 'block' : 'none';
+      errorBox.textContent = message || '';
+    }
+
+    function render(data) {
+      stateBox.classList.remove('running', 'starting', 'stopped');
+      if (data.starting) {
+        stateBox.classList.add('starting');
+        stateText.textContent = '正在开启代理...';
+      } else if (data.running) {
+        stateBox.classList.add('running');
+        stateText.textContent = '代理运行中';
+      } else {
+        stateBox.classList.add('stopped');
+        stateText.textContent = '代理已关闭';
+      }
+      proxyURL.textContent = data.proxyURL || '-';
+      model.textContent = data.model || '-';
+      startedAt.textContent = data.startedAt || '-';
+      stoppedAt.textContent = data.stoppedAt || '-';
+      startBtn.disabled = Boolean(data.running || data.starting);
+      stopBtn.disabled = Boolean(!data.running && !data.starting);
+      showError(data.lastError || '');
+    }
+
+    async function request(path, method = 'GET') {
+      const response = await fetch(path, { method });
+      const data = await response.json();
+      render(data);
+      if (!response.ok && data.lastError) {
+        throw new Error(data.lastError);
+      }
+      return data;
+    }
+
+    async function refresh() {
+      try {
+        await request('/control/status');
+      } catch (err) {
+        showError(String(err.message || err));
+      }
+    }
+
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      stateBox.classList.remove('running', 'stopped');
+      stateBox.classList.add('starting');
+      stateText.textContent = '正在开启代理...';
+      try {
+        await request('/control/start', 'POST');
+      } catch (err) {
+        showError(String(err.message || err));
+      }
+    });
+    stopBtn.addEventListener('click', () => request('/control/stop', 'POST').catch(err => showError(String(err.message || err))));
+    exitBtn.addEventListener('click', () => request('/control/exit', 'POST').then(() => {
+      stateText.textContent = '程序正在退出...';
+      startBtn.disabled = true;
+      stopBtn.disabled = true;
+      exitBtn.disabled = true;
+    }).catch(err => showError(String(err.message || err))));
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>`
+
 func main() {
 	applyModelFlag()
 	setupLogging()
-	if err := syncCCSwitchAndCodex(); err != nil {
-		log.Fatal("[CCMimoLink] startup sync failed: ", err)
-	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleManagerUI)
+	mux.HandleFunc("/control/status", handleControlStatus)
+	mux.HandleFunc("/control/start", handleControlStart)
+	mux.HandleFunc("/control/stop", handleControlStop)
+	mux.HandleFunc("/control/exit", handleControlExit)
 	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", 405)
 			return
 		}
-		handleResponses(w, r)
+		requireProxyRunning(handleResponses)(w, r)
 	})
-	mux.HandleFunc("/v1/responses/compact", handleCompact)
-	mux.HandleFunc("/v1/responses/", handleGetResponse)
-	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/v1/responses/compact", requireProxyRunning(handleCompact))
+	mux.HandleFunc("/v1/responses/", requireProxyRunning(handleGetResponse))
+	mux.HandleFunc("/v1/models", requireProxyRunning(handleModels))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+		if proxyControl.IsRunning() {
+			w.Write([]byte("ok"))
+			return
+		}
+		http.Error(w, "stopped", http.StatusServiceUnavailable)
 	})
 
 	addr := "127.0.0.1:" + proxyPort
-	log.Printf("[CCMimoLink] http://%s/v1", addr)
+	managerURL := "http://" + addr + "/"
+	log.Printf("[CCMimoLink] manager UI: %s", managerURL)
 
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
+	if autoStartProxy {
+		if err := proxyControl.Start(); err != nil {
+			log.Fatal("[CCMimoLink] startup sync failed: ", err)
+		}
+		log.Printf("[CCMimoLink] proxy auto-started at %s", localProxyURL())
+	}
+	if !noBrowserOpen {
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			openManagerBrowser(managerURL)
+		}()
+	}
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }

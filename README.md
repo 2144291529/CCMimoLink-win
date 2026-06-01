@@ -2,7 +2,7 @@
 
 > A local routing bridge that brings Xiaomi MiMo to `cc switch` + Codex.
 
-[🌐 Homepage](https://simonleen22.github.io/CCMimoLink/) · [中文文档](#中文) · [Windows 使用指南（中文）](USAGE_zh.md) · [Releases](https://github.com/2144291529/CCMimoLink-win/releases)
+[🌐 Homepage](https://simonleen22.github.io/CCMimoLink/) · [中文文档](#中文) · [Windows 使用指南（中文）](USAGE_zh.md)
 
 ---
 
@@ -77,7 +77,7 @@ Rewrite routes and refresh config without starting the proxy:
 ./ccmimolink.exe --sync-only
 ```
 
-### Step 4: Run the proxy
+### Step 4: Open the manager UI
 
 ```bash
 ./ccmimolink
@@ -85,7 +85,18 @@ Rewrite routes and refresh config without starting the proxy:
 ./ccmimolink.exe
 ```
 
-Default local proxy address: `http://127.0.0.1:9876/v1`
+The executable opens a local manager UI at `http://127.0.0.1:9876/`.
+Click **Start Proxy** to enable the local proxy, or **Stop Proxy** to disable it while keeping the manager UI available.
+
+Default local proxy address after starting: `http://127.0.0.1:9876/v1`
+
+To keep the old immediate-start behavior:
+
+```bash
+./ccmimolink --auto-start
+# Windows
+./ccmimolink.exe --auto-start
+```
 
 ### Step 5: Switch models (optional)
 
@@ -119,6 +130,16 @@ All runtime settings are provided via environment variables:
 | `CC_SWITCH_SETTINGS_PATH` | `~/.cc-switch/settings.json` (Windows: `%USERPROFILE%\.cc-switch\settings.json`) | Path to cc switch settings file. |
 | `CC_SWITCH_DB_PATH` | `~/.cc-switch/cc-switch.db` (Windows: `%USERPROFILE%\.cc-switch\cc-switch.db`) | Path to cc switch database. |
 | `CODEX_CONFIG_PATH` | `~/.codex/config.toml` (Windows: `%USERPROFILE%\.codex\config.toml`) | Path to local Codex config. |
+
+## Startup Flags
+
+| Flag | Description |
+| --- | --- |
+| `--sync-only` | Sync cc switch and Codex config, then exit. |
+| `--auto-start` | Start the proxy immediately after the manager UI starts. |
+| `--no-open` | Do not automatically open the manager UI in the browser. |
+| `--v2.5` | Use `mimo-v2.5` for text requests. |
+| `--v2.5-pro` | Use `mimo-v2.5-pro` for text requests. |
 
 ## Supported Endpoints
 
