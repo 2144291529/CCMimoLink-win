@@ -24,6 +24,7 @@ User → Codex → CCMimoLink (local proxy) → Xiaomi MiMo upstream
 ### Protocol Adaptation
 
 - **Responses → Chat Completions**: Translates OpenAI-style `/v1/responses` into MiMo's chat-completions format, injecting `instructions` as a system message when needed.
+- **Anthropic Messages Adapter** (v2.0): Optional upstream protocol via `MIMO_UPSTREAM_PROTOCOL=anthropic` — routes through Anthropic Messages API with extended thinking support, correct message conversion, and tool choice mapping.
 - **Tool Compatibility Layer**: Preserves standard function tools, normalizes `tool_choice`, and filters unsupported built-in tools to prevent upstream failures.
 - **Multi-turn Continuation**: Maintains bounded in-memory state for response chains, supports `previous_response_id`, and replays function-call context and provider reasoning across turns.
 - **Streaming Fidelity**: Preserves true incremental streaming, emitting Responses-style events while reading from the MiMo upstream stream.
@@ -32,13 +33,21 @@ User → Codex → CCMimoLink (local proxy) → Xiaomi MiMo upstream
 
 - **Multimodal Fallback**: Requests containing images automatically fall back to `mimo-v2.5` for compatibility.
 - **Dynamic Model Switching**: Text requests can switch between `mimo-v2.5` and `mimo-v2.5-pro` via environment variables or startup flags.
+- **describe_image Tool** (v2.0): When `mimo-v2.5-pro` receives image requests, the proxy injects a `describe_image` tool — pro calls it, proxy internally uses `mimo-v2.5` to read the image, and feeds the description back.
 
 ### Safety and Resilience
 
 - **Safe Startup Sync**: Automatically backs up Codex config before rewriting.
 - **Throttling and Backoff**: Built-in request rate limiting with upstream `429` retry backoff.
+- **HTTP Resilience** (v2.0): `ResponseHeaderTimeout` (60s) kills upstream that never returns headers; `idleTimeoutBody` closes stalled response bodies after 60s of no reads, releasing limiter slots.
 - **XML Fallback Parsing**: Recovers tool-call intent from tool-call-like text output when needed.
 - **Local Compact Handling**: Handles `compact` control-plane requests locally instead of letting them fail upstream.
+
+### Manager UI (Windows Fork)
+
+- **Web Dashboard**: Local management UI at `http://127.0.0.1:9876/` — start/stop proxy, view status, model info.
+- **Auto-start Mode**: `--auto-start` flag starts the proxy immediately on launch.
+- **Browser Control**: Automatically opens the manager UI in your default browser (disable with `--no-open`).
 
 ## How It Works
 
@@ -120,16 +129,19 @@ All runtime settings are provided via environment variables:
 | --- | --- | --- |
 | `MIMO_API_KEY` | empty | Fallback MiMo upstream API key. Normally the key comes from the `X-Mimo-Api-Key` header; this is only a safety net. |
 | `MIMO_BASE_URL` | `https://token-plan-cn.xiaomimimo.com/v1` | MiMo upstream base URL. |
-| `MIMO_MODEL` | `mimo-v2.5` | Default text model. |
+| `MIMO_MODEL` | `mimo-v2.5-pro` | Default text model. |
+| `MIMO_UPSTREAM_PROTOCOL` | empty | Set to `anthropic` to use Anthropic Messages API as upstream protocol (v2.0). |
 | `MIMO_PROXY_PORT` | `9876` | Local listen port. |
-| `MIMO_PROXY_MAX_CONCURRENT` | `1` | Maximum concurrent upstream requests. |
-| `MIMO_PROXY_MIN_INTERVAL_MS` | `1500` | Minimum delay between upstream requests (ms). |
+| `MIMO_PROXY_MAX_CONCURRENT` | `4` | Maximum concurrent upstream requests. |
+| `MIMO_PROXY_MIN_INTERVAL_MS` | `600` | Minimum delay between upstream requests (ms). |
 | `MIMO_PROXY_429_BACKOFF_MS` | `30000` | Backoff duration after an upstream `429` response (ms). |
 | `MIMO_PROXY_LOG` | `mimo_proxy.log` | Log file path. |
 | `MIMO_PROXY_SKIP_CC_SWITCH_SYNC` | `false` | Skip startup sync (for development). |
+| `MIMO_DEBUG_DUMP` | empty | Directory for debug request/response dumps (v2.0). |
 | `CC_SWITCH_SETTINGS_PATH` | `~/.cc-switch/settings.json` (Windows: `%USERPROFILE%\.cc-switch\settings.json`) | Path to cc switch settings file. |
 | `CC_SWITCH_DB_PATH` | `~/.cc-switch/cc-switch.db` (Windows: `%USERPROFILE%\.cc-switch\cc-switch.db`) | Path to cc switch database. |
 | `CODEX_CONFIG_PATH` | `~/.codex/config.toml` (Windows: `%USERPROFILE%\.codex\config.toml`) | Path to local Codex config. |
+| `CODEX_AUTH_PATH` | `~/.codex/auth.json` (Windows: `%USERPROFILE%\.codex\auth.json`) | Path to Codex auth file (v2.0). |
 
 ## Startup Flags
 
@@ -238,6 +250,7 @@ CCMimoLink 不是又一个反向代理。它是一个主动协议适配层——
 ### 协议适配
 
 - **Responses → Chat Completions**：把 OpenAI 风格的 `/v1/responses` 请求翻译成 MiMo 的 chat-completions 格式，必要时把 `instructions` 注入为 system message
+- **Anthropic Messages 适配器**（v2.0）：通过 `MIMO_UPSTREAM_PROTOCOL=anthropic` 可选使用 Anthropic Messages API 作为上游协议，支持扩展思考、正确的消息转换和工具选择映射
 - **Tool 兼容层**：保留标准 function tool，规范化 `tool_choice`，过滤不兼容的 built-in tool 避免整条请求崩掉
 - **多轮续接**：通过有界内存保存 response-chain 状态，支持 `previous_response_id`，在多轮交互中回放 function-call 上下文和 provider reasoning 状态
 - **流式保真**：保留真实的增量流式路径，在读取 MiMo 上游流时发出 Responses 风格事件
@@ -246,13 +259,21 @@ CCMimoLink 不是又一个反向代理。它是一个主动协议适配层——
 
 - **多模态回落**：请求中带图片时，自动回落到 `mimo-v2.5` 保证兼容性
 - **动态模型切换**：纯文本请求可在 `mimo-v2.5` 与 `mimo-v2.5-pro` 之间通过环境变量或启动参数动态切换
+- **describe_image 工具**（v2.0）：`mimo-v2.5-pro` 收到图片请求时，proxy 注入 `describe_image` 工具，pro 调用后 proxy 内部用 `mimo-v2.5` 读图，再把描述回灌给 pro
 
 ### 安全与韧性
 
 - **启动安全同步**：回写 Codex 配置前自动备份原始文件
 - **限流与退避**：自带请求限流和上游 `429` 退避处理
+- **HTTP 韧性**（v2.0）：`ResponseHeaderTimeout`（60s）终止永远不返回头的上游；`idleTimeoutBody` 在 60s 无读取后自动关闭卡住的响应体，释放限流槽位
 - **XML 兜底解析**：必要时可以从类 tool-call 文本中恢复工具调用意图
 - **本地 compact 处理**：对 `compact` 这类控制面请求提供本地处理，不把错误甩给上游
+
+### 管理界面（Windows Fork 特有）
+
+- **Web 仪表盘**：本地管理 UI 在 `http://127.0.0.1:9876/`，可启停代理、查看状态和模型信息
+- **自动启动模式**：`--auto-start` 参数让代理在启动时立即运行
+- **浏览器控制**：自动在默认浏览器中打开管理 UI（用 `--no-open` 禁用）
 
 ## 工作流程
 
@@ -317,16 +338,19 @@ MIMO_MODEL="mimo-v2.5-pro" ./ccmimolink
 | --- | --- | --- |
 | `MIMO_API_KEY` | 空 | MiMo 上游备用 API Key。正常情况下 Key 来自请求头 `X-Mimo-Api-Key`，此项仅作兜底。 |
 | `MIMO_BASE_URL` | `https://token-plan-cn.xiaomimimo.com/v1` | MiMo 上游地址 |
-| `MIMO_MODEL` | `mimo-v2.5` | 默认文本模型 |
+| `MIMO_MODEL` | `mimo-v2.5-pro` | 默认文本模型 |
+| `MIMO_UPSTREAM_PROTOCOL` | 空 | 设为 `anthropic` 使用 Anthropic Messages API 作为上游协议（v2.0） |
 | `MIMO_PROXY_PORT` | `9876` | 本地监听端口 |
-| `MIMO_PROXY_MAX_CONCURRENT` | `1` | 最大并发上游请求数 |
-| `MIMO_PROXY_MIN_INTERVAL_MS` | `1500` | 上游请求最小间隔（毫秒） |
+| `MIMO_PROXY_MAX_CONCURRENT` | `4` | 最大并发上游请求数 |
+| `MIMO_PROXY_MIN_INTERVAL_MS` | `600` | 上游请求最小间隔（毫秒） |
 | `MIMO_PROXY_429_BACKOFF_MS` | `30000` | 收到上游 `429` 后的退避时间（毫秒） |
 | `MIMO_PROXY_LOG` | `mimo_proxy.log` | 日志文件路径 |
 | `MIMO_PROXY_SKIP_CC_SWITCH_SYNC` | `false` | 跳过启动同步（开发调试用） |
+| `MIMO_DEBUG_DUMP` | 空 | 调试用请求/响应 dump 目录（v2.0） |
 | `CC_SWITCH_SETTINGS_PATH` | `~/.cc-switch/settings.json` | cc switch 配置文件路径 |
 | `CC_SWITCH_DB_PATH` | `~/.cc-switch/cc-switch.db` | cc switch 数据库路径 |
 | `CODEX_CONFIG_PATH` | `~/.codex/config.toml` | Codex 配置文件路径 |
+| `CODEX_AUTH_PATH` | `~/.codex/auth.json` | Codex 认证文件路径（v2.0） |
 
 ## 支持的接口
 
